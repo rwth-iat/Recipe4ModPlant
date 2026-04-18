@@ -2121,7 +2121,7 @@
     "mtp_id": 1353,
     "label": "Liter pro Stunde",
     "si_uri": null,
-    "qudt_uri": null
+    "qudt_uri": "http://qudt.org/vocab/unit/L-PER-HR"
   },
   {
     "mtp_id": 1354,
