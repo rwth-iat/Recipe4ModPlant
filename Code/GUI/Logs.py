@@ -1,18 +1,22 @@
 # Code/GUI/Logs.py
 import json
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
+from xml.etree import ElementTree as ET
 
 from PyQt6.QtCore import QPointF, QRectF, QSignalBlocker, Qt
 from PyQt6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QPainter, QPen, QPolygonF, QTextCursor
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QFrame,
-    QWidget,
-    QVBoxLayout,
     QHBoxLayout,
-    QSizePolicy,
+    QHeaderView,
     QStackedWidget,
     QTextEdit,
+    QTreeWidgetItem,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
 )
 from qfluentwidgets import (
     BodyLabel,
@@ -21,6 +25,7 @@ from qfluentwidgets import (
     FluentIcon as FIF,
     SmoothScrollArea,
     StrongBodyLabel,
+    TreeWidget,
     TextEdit,
     SubtitleLabel,
     CaptionLabel,
@@ -73,6 +78,328 @@ class MetricCard(CardWidget):
 
     def set_value(self, value: str):
         self.value.setText(value)
+
+
+class StructuredLogView(QWidget):
+    """Read-only tree inspector for structured JSON/XML payloads with text fallback."""
+
+    MAX_TREE_ITEMS = 9000
+    MAX_DISPLAY_VALUE_LENGTH = 160
+
+    def __init__(self, mono_font: QFont, parent=None):
+        super().__init__(parent)
+        self._mono_font = mono_font
+        self._tree_items_added = 0
+        self._tree_truncated = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.stack = QStackedWidget(self)
+
+        self.tree = TreeWidget(self)
+        self.tree.setObjectName("structuredLogTree")
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Field", "Value"])
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setAnimated(True)
+        self.tree.setIndentation(14)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setItemsExpandable(True)
+        self.tree.setAllColumnsShowFocus(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tree.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.tree.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.tree.header().setStretchLastSection(True)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.setColumnWidth(0, 190)
+
+        compact_font = QFont(self.font())
+        compact_font.setPointSizeF(9.5)
+        self.tree.setFont(compact_font)
+
+        header_font = QFont(compact_font)
+        header_font.setBold(True)
+        header_font.setPointSizeF(9.0)
+        self.tree.header().setFont(header_font)
+        self.tree.setStyleSheet(
+            """
+            TreeWidget#structuredLogTree, QTreeWidget#structuredLogTree {
+                background-color: rgba(255, 255, 255, 0.025);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 18px;
+                color: #E7ECF2;
+                padding: 4px;
+                alternate-background-color: rgba(255, 255, 255, 0.02);
+                selection-background-color: rgba(74, 163, 255, 0.18);
+            }
+            TreeWidget#structuredLogTree::item, QTreeWidget#structuredLogTree::item {
+                min-height: 22px;
+                padding: 1px 4px;
+                border-radius: 6px;
+            }
+            TreeWidget#structuredLogTree::item:hover, QTreeWidget#structuredLogTree::item:hover {
+                background-color: rgba(255, 255, 255, 0.05);
+            }
+            QHeaderView::section {
+                background-color: rgba(255, 255, 255, 0.045);
+                color: #96AEC8;
+                border: none;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+                padding: 5px 8px;
+                font-size: 10px;
+                font-weight: 700;
+            }
+            """
+        )
+
+        self.text_view = TextEdit(self)
+        self.text_view.setReadOnly(True)
+        self.text_view.setFont(self._mono_font)
+        self.text_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.text_view.setStyleSheet(
+            """
+            QTextEdit {
+                background-color: rgba(255, 255, 255, 0.025);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 18px;
+                padding: 10px 12px;
+                color: #E7ECF2;
+                selection-background-color: rgba(74, 163, 255, 0.35);
+            }
+            """
+        )
+
+        self.stack.addWidget(self.tree)
+        self.stack.addWidget(self.text_view)
+        layout.addWidget(self.stack)
+
+    @staticmethod
+    def _placeholder(title: str, body: str) -> str:
+        return f"{title}\n{'=' * len(title)}\n\n{body}"
+
+    @staticmethod
+    def _looks_like_json(text: str) -> bool:
+        stripped = (text or "").lstrip()
+        return stripped.startswith("{") or stripped.startswith("[")
+
+    @staticmethod
+    def _looks_like_xml(text: str) -> bool:
+        stripped = (text or "").lstrip()
+        return stripped.startswith("<")
+
+    def _clear_tree(self):
+        self.tree.clear()
+        self._tree_items_added = 0
+        self._tree_truncated = False
+
+    def _show_tree(self):
+        self.stack.setCurrentWidget(self.tree)
+        self.tree.expandAll()
+
+    def _show_text(self, text: str):
+        limited_text = text or ""
+        if len(limited_text) > MAX_DEBUG_TEXT_LENGTH:
+            hidden = len(limited_text) - MAX_DEBUG_TEXT_LENGTH
+            limited_text = (
+                limited_text[:MAX_DEBUG_TEXT_LENGTH]
+                + f"\n\n[Truncated in UI]\nThis fallback text view was shortened by {hidden} characters."
+            )
+        self.text_view.setPlainText(limited_text)
+        self.stack.setCurrentWidget(self.text_view)
+
+    @classmethod
+    def _summary_for_node(cls, data: Any) -> str:
+        if isinstance(data, dict):
+            size = len(data)
+            return f"Object · {size} field(s)"
+        if isinstance(data, list):
+            size = len(data)
+            return f"Array · {size} item(s)"
+        if data is None:
+            return "null"
+
+        text = str(data)
+        if len(text) > cls.MAX_DISPLAY_VALUE_LENGTH:
+            return text[: cls.MAX_DISPLAY_VALUE_LENGTH - 1] + "…"
+        return text
+
+    def _make_item(self, label: str, value: str = "", dimmed: bool = False) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([label, value])
+        tooltip = label if not value else f"{label}\n{value}"
+        item.setToolTip(0, tooltip)
+        item.setToolTip(1, value or label)
+
+        if dimmed:
+            dim_color = QColor("#8EA1B4")
+            item.setForeground(0, dim_color)
+            item.setForeground(1, dim_color)
+
+        self._tree_items_added += 1
+        return item
+
+    def _append_truncation_hint(self, parent_item: QTreeWidgetItem):
+        if self._tree_truncated:
+            return
+
+        parent_item.addChild(
+            self._make_item(
+                "… truncated",
+                "The structured preview was shortened to keep the UI responsive.",
+                dimmed=True,
+            )
+        )
+        self._tree_truncated = True
+
+    def _populate_json_item(self, parent_item: QTreeWidgetItem, data: Any):
+        if self._tree_truncated:
+            return
+
+        if self._tree_items_added >= self.MAX_TREE_ITEMS:
+            self._append_truncation_hint(parent_item)
+            return
+
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if self._tree_truncated:
+                    break
+                if self._tree_items_added >= self.MAX_TREE_ITEMS:
+                    self._append_truncation_hint(parent_item)
+                    break
+                child = self._make_item(str(key), self._summary_for_node(value))
+                parent_item.addChild(child)
+                if isinstance(value, (dict, list)):
+                    self._populate_json_item(child, value)
+        elif isinstance(data, list):
+            for index, value in enumerate(data):
+                if self._tree_truncated:
+                    break
+                if self._tree_items_added >= self.MAX_TREE_ITEMS:
+                    self._append_truncation_hint(parent_item)
+                    break
+                child = self._make_item(f"[{index}]", self._summary_for_node(value))
+                parent_item.addChild(child)
+                if isinstance(value, (dict, list)):
+                    self._populate_json_item(child, value)
+
+    def _set_json_tree(self, data: Any, title: str):
+        self._clear_tree()
+        root = self._make_item(title, self._summary_for_node(data))
+        self.tree.addTopLevelItem(root)
+
+        if isinstance(data, (dict, list)):
+            self._populate_json_item(root, data)
+
+        self._show_tree()
+
+    def _populate_xml_item(self, parent_item: QTreeWidgetItem, element: ET.Element):
+        if self._tree_truncated:
+            return
+
+        if self._tree_items_added >= self.MAX_TREE_ITEMS:
+            self._append_truncation_hint(parent_item)
+            return
+
+        if element.attrib:
+            attributes_item = self._make_item("@attributes", f"{len(element.attrib)} attribute(s)", dimmed=True)
+            parent_item.addChild(attributes_item)
+            for name, value in element.attrib.items():
+                if self._tree_truncated:
+                    break
+                if self._tree_items_added >= self.MAX_TREE_ITEMS:
+                    self._append_truncation_hint(attributes_item)
+                    break
+                attributes_item.addChild(self._make_item(name, str(value)))
+
+        text = (element.text or "").strip()
+        children = list(element)
+        has_attributes = bool(element.attrib)
+        show_text_child = bool(text) and (has_attributes or bool(children))
+
+        if show_text_child and not self._tree_truncated:
+            if self._tree_items_added >= self.MAX_TREE_ITEMS:
+                self._append_truncation_hint(parent_item)
+                return
+            parent_item.addChild(self._make_item("#text", self._summary_for_node(text), dimmed=True))
+
+        for child_element in children:
+            if self._tree_truncated:
+                break
+            if self._tree_items_added >= self.MAX_TREE_ITEMS:
+                self._append_truncation_hint(parent_item)
+                break
+            summary_parts = []
+            child_text = (child_element.text or "").strip()
+            if child_element.attrib:
+                summary_parts.append(f"{len(child_element.attrib)} attr")
+            if list(child_element):
+                summary_parts.append(f"{len(list(child_element))} child")
+            elif child_text:
+                summary_parts.append(self._summary_for_node(child_text))
+
+            summary = " · ".join(summary_parts)
+            child_item = self._make_item(f"<{child_element.tag}>", summary)
+            parent_item.addChild(child_item)
+            self._populate_xml_item(child_item, child_element)
+
+    def _set_xml_tree(self, xml_text: str, title: str):
+        self._clear_tree()
+        root_element = ET.fromstring(xml_text)
+        summary = f"Element · <{root_element.tag}>"
+        root = self._make_item(title, summary)
+        self.tree.addTopLevelItem(root)
+        root_item = self._make_item(f"<{root_element.tag}>", f"{len(list(root_element))} child node(s)")
+        root.addChild(root_item)
+        self._populate_xml_item(root_item, root_element)
+        self._show_tree()
+
+    def set_placeholder(self, title: str, body: str):
+        self._clear_tree()
+        self._show_text(self._placeholder(title, body))
+
+    def set_text(self, text: str):
+        self._clear_tree()
+        self._show_text(text)
+
+    def set_structured_content(self, content: Any, title: str, format_hint: str = ""):
+        hint = (format_hint or "").lower()
+
+        try:
+            if hint == "json":
+                if isinstance(content, str):
+                    self._set_json_tree(json.loads(content), title)
+                    return
+                self._set_json_tree(content, title)
+                return
+
+            if hint == "xml":
+                if isinstance(content, str):
+                    self._set_xml_tree(content, title)
+                    return
+                self._show_text(self._placeholder(title, "The XML preview is not available as text."))
+                return
+
+            if isinstance(content, (dict, list)):
+                self._set_json_tree(content, title)
+                return
+
+            if isinstance(content, str):
+                if self._looks_like_json(content):
+                    self._set_json_tree(json.loads(content), title)
+                    return
+                if self._looks_like_xml(content):
+                    self._set_xml_tree(content, title)
+                    return
+                self._show_text(content)
+                return
+
+            self._show_text(str(content))
+        except (json.JSONDecodeError, ET.ParseError, TypeError, ValueError):
+            fallback_text = str(content) if content is not None else self._placeholder(title, "No data available.")
+            self._show_text(fallback_text)
 
 
 class FlowStepConnector(QWidget):
@@ -805,11 +1132,11 @@ class LogPage(QWidget):
         )
 
         self.log_edit = self._create_text_view()
-        self.recipe_view = self._create_text_view()
-        self.resources_view = self._create_text_view()
+        self.recipe_view = self._create_structured_view()
+        self.resources_view = self._create_structured_view()
         self.smt_model_view = self._create_text_view()
-        self.master_recipe_view = self._create_text_view()
-        self.matching_debug_view = self._create_text_view()
+        self.master_recipe_view = self._create_structured_view()
+        self.matching_debug_view = self._create_structured_view()
         self.flow_view = MasterRecipeFlowView(self)
 
         page_widgets = {
@@ -849,6 +1176,9 @@ class LogPage(QWidget):
             """
         )
         return editor
+
+    def _create_structured_view(self) -> StructuredLogView:
+        return StructuredLogView(self._mono_font, self)
 
     def _add_tab_page(self, route_key: str, text: str, widget: QWidget, icon):
         widget.setObjectName(route_key)
@@ -914,20 +1244,24 @@ class LogPage(QWidget):
         view.setPlainText(self._limit_text(text, title))
 
     def _reset_structured_tabs(self):
-        self.recipe_view.setPlainText(
-            self._placeholder("parsed_recipe", "Run the calculation to inspect the parsed recipe structure.")
+        self.recipe_view.set_placeholder(
+            "parsed_recipe",
+            "Run the calculation to inspect the parsed recipe structure.",
         )
-        self.resources_view.setPlainText(
-            self._placeholder("parsed_resources", "Parsed AAS/XML resource capabilities will appear here.")
+        self.resources_view.set_placeholder(
+            "parsed_resources",
+            "Parsed AAS/XML resource capabilities will appear here.",
         )
         self.smt_model_view.setPlainText(
             self._placeholder("SMT2-Modell", "The generated SMT constraint model will appear here after a run.")
         )
-        self.master_recipe_view.setPlainText(
-            self._placeholder("Master Recipe", "A preview XML for the default solution will appear here.")
+        self.master_recipe_view.set_placeholder(
+            "Master Recipe",
+            "A preview XML for the default solution will appear here.",
         )
-        self.matching_debug_view.setPlainText(
-            self._placeholder("Matching Debug", "Per-step and per-resource capability matching diagnostics will appear here.")
+        self.matching_debug_view.set_placeholder(
+            "Matching Debug",
+            "Per-step and per-resource capability matching diagnostics will appear here.",
         )
         self.flow_view.set_flow_nodes([])
 
@@ -999,8 +1333,8 @@ class LogPage(QWidget):
                 preview_solution=preview_solution_id,
             )
 
-            self._set_view_text(self.recipe_view, self._format_json(recipe), "parsed_recipe")
-            self._set_view_text(self.resources_view, self._format_json(resources), "parsed_resources")
+            self.recipe_view.set_structured_content(recipe, "parsed_recipe", format_hint="json")
+            self.resources_view.set_structured_content(resources, "parsed_resources", format_hint="json")
 
             smt_model = self.context_data.get("smt_model") or self._placeholder(
                 "SMT2-Modell",
@@ -1012,14 +1346,10 @@ class LogPage(QWidget):
                 "Master Recipe",
                 "No preview XML is available. This can happen when no valid solution was found.",
             )
-            self._set_view_text(self.master_recipe_view, master_recipe_preview, "Master Recipe")
+            self.master_recipe_view.set_structured_content(master_recipe_preview, "Master Recipe", format_hint="xml")
 
             matching_debug = self.context_data.get("matching_debug") or []
-            self._set_view_text(
-                self.matching_debug_view,
-                self._format_json(matching_debug),
-                "Matching Debug",
-            )
+            self.matching_debug_view.set_structured_content(matching_debug, "Matching Debug", format_hint="json")
 
             self.flow_view.set_flow_nodes(self.context_data.get("master_recipe_flow") or [])
             self.append_log("Structured debug panes updated for the latest run.")
