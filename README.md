@@ -1,8 +1,6 @@
-# Plant Configurator and Master Recipe Generator
+# Recipe4ModPlant
 
-**Plant Configurator and Master Recipe Generator** is a desktop tool for resource matching and B2MML master recipe generation in modular production plants. It parses **B2MML General Recipes**, reads **Asset Administration Shell (AAS)** capability data, and uses the **Z3 SMT solver** to calculate feasible resource assignments.
-
-The application provides a PyQt-based GUI for running calculations, reviewing all valid solutions, ranking solutions by weighted cost, exporting master recipes, validating generated XML files, and inspecting execution logs.
+An open-source desktop tool that processes plant configurations created by the SMT4ModPlant Framework to determine optimal plant configurations and their derived master recipes in BatchML. The application provides a PyQt-based GUI for reviewing all valid plant configurations, for evaluating and sorting them by weighted cost, for exporting master recipes, for verifying the generated master recipes against the BatchML schema, and for inspecting execution logs.
 
 ---
 
