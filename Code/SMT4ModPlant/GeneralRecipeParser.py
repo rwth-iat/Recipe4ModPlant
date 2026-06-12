@@ -68,14 +68,28 @@ def parse_general_recipe(file_path):
         }
 
         for param in process_element.findall('.//b2mml:ProcessElementParameter', ns):
-            value = param.find('b2mml:Value', ns)
+            values = []
+            for value in param.findall('b2mml:Value', ns):
+                values.append({
+                    'ValueString': value.find('b2mml:ValueString', ns).text
+                    if value.find('b2mml:ValueString', ns) is not None else None,
+                    'DataType': value.find('b2mml:DataType', ns).text
+                    if value.find('b2mml:DataType', ns) is not None else None,
+                    'UnitOfMeasure': value.find('b2mml:UnitOfMeasure', ns).text
+                    if value.find('b2mml:UnitOfMeasure', ns) is not None else None,
+                    'Key': value.find('b2mml:Key', ns).text
+                    if value.find('b2mml:Key', ns) is not None else None
+                })
+
+            first_value = values[0] if values else {}
             pe_data['Parameters'].append({
                 'ID': param.find('b2mml:ID', ns).text,
                 'Description': param.find('b2mml:Description', ns).text,
-                'ValueString': value.find('b2mml:ValueString', ns).text if value is not None else None,
-                'DataType': value.find('b2mml:DataType', ns).text if value is not None else None,
-                'UnitOfMeasure': value.find('b2mml:UnitOfMeasure', ns).text if value is not None else None,
-                'Key': value.find('b2mml:Key', ns).text if value is not None else None
+                'ValueString': first_value.get('ValueString'),
+                'DataType': first_value.get('DataType'),
+                'UnitOfMeasure': first_value.get('UnitOfMeasure'),
+                'Key': first_value.get('Key'),
+                'Values': values
             })
 
         # Semantic Description

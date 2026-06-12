@@ -6,7 +6,7 @@ An open-source desktop tool that processes plant configurations created by the S
 
 ## 🌟 Key Features
 
-* **SMT-based resource matching**: Matches recipe requirements against AAS capabilities using **Z3**.
+* **SMT-based resource and capability matching**: Matches recipe requirements against concrete AAS capability variants using **Z3**.
 * **Two result modes**:
   * **All Results**: Computes all valid assignments and displays them in the results table.
   * **Weighted Sorted Results**: Computes all valid assignments and ranks them by weighted Energy Cost, Use Cost, and CO2 Footprint.
@@ -124,7 +124,8 @@ Click **Start Calculation** to begin parsing and solving.
 
 In the **Results** panel:
 
-* Review all returned solutions in a table view.
+* Review all returned resource/capability variants in a table view.
+* Each solution identifies one concrete capability per process step, even when the same resource offers multiple valid capabilities.
 * In weighted mode, solutions are grouped and labeled with their total weighted score.
 * Select one or more solutions using the checkboxes.
 * Click **Export Selected** to generate one or more `MasterRecipe_Sol_<id>.xml` files.

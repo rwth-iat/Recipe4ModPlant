@@ -71,8 +71,11 @@ class SMTWorker(QThread):
         previous_step_label = "Init"
         for index, step in enumerate(recipe_data.get("ProcessElements", []), start=1):
             assignment = assignment_by_step.get(step.get("ID"), {})
-            capabilities = assignment.get("capabilities") or []
-            capability_name = capabilities[0] if capabilities else "No capability"
+            selected_capability = assignment.get("selected_capability") or {}
+            capability_name = selected_capability.get("name")
+            if not capability_name:
+                capabilities = assignment.get("capabilities") or []
+                capability_name = capabilities[0] if capabilities else "No capability"
             resource_name = assignment.get("resource", "No resource")
             step_label = step.get("Description", step.get("ID", "Step"))
 
@@ -229,6 +232,7 @@ class SMTWorker(QThread):
                         general_recipe_data=preview_recipe_data,
                         selected_solution_id=preview_solution_id,
                         output_path=None,
+                        log_callback=self.log_signal.emit,
                     )
                     master_recipe_flow = self._build_master_recipe_flow(
                         recipe_data=recipe_data,

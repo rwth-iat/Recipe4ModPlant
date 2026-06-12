@@ -3,8 +3,8 @@ import os
 import sys
 from typing import List, Dict, Optional
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, QRect, QTimer
+from PyQt6.QtGui import QColor, QFontMetrics
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QFileDialog,
+    QStyleOptionViewItem,
 )
 
 from qfluentwidgets import (
@@ -66,9 +67,17 @@ class ResultsWidget(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setBorderVisible(True)
         self.table.setWordWrap(True)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideNone)
 
         self.table.setSelectionMode(TableWidget.SelectionMode.NoSelection)
         self.table.itemChanged.connect(self.on_item_changed)
+
+        self._row_resize_timer = QTimer(self)
+        self._row_resize_timer.setSingleShot(True)
+        self._row_resize_timer.timeout.connect(self._resize_result_rows)
+        self.table.horizontalHeader().sectionResized.connect(
+            lambda _index, _old_size, _new_size: self._row_resize_timer.start(0)
+        )
 
         layout.addLayout(header_layout)
         layout.addWidget(self.table, 1)
@@ -224,6 +233,7 @@ class ResultsWidget(QWidget):
                     general_recipe_data=self.context_data["recipe"],
                     selected_solution_id=sol_id,
                     output_path=full_path,
+                    log_callback=self._append_log,
                 )
                 success_count += 1
 
@@ -505,10 +515,74 @@ class ResultsWidget(QWidget):
         """Format capabilities for readable full display in table cells."""
         if isinstance(raw_capabilities, (list, tuple, set)):
             return "\n".join(str(x) for x in raw_capabilities)
-        text = str(raw_capabilities) if raw_capabilities is not None else ""
-        if ", " in text:
-            return text.replace(", ", ",\n")
+        return str(raw_capabilities) if raw_capabilities is not None else ""
+
+    @staticmethod
+    def _format_resource_text(raw_resource) -> str:
+        """Hide the internal resource-key prefix in the result table."""
+        text = str(raw_resource) if raw_resource is not None else ""
+        if text.lower().startswith("resource:"):
+            return text[len("resource:"):].lstrip()
         return text
+
+    def _resize_result_rows(self):
+        """Size every row for all explicit and automatically wrapped text lines."""
+        if self.table.rowCount() == 0:
+            return
+
+        default_height = max(
+            self.table.verticalHeader().defaultSectionSize(),
+            self.table.fontMetrics().lineSpacing() + 12,
+        )
+        wrap_flags = Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextExpandTabs
+
+        for row in range(self.table.rowCount()):
+            row_height = default_height
+            for column in range(self.table.columnCount()):
+                item = self.table.item(row, column)
+                if item is None or not item.text():
+                    continue
+
+                index = self.table.model().index(row, column)
+                option = QStyleOptionViewItem()
+                option.initFrom(self.table)
+                delegate = (
+                    self.table.itemDelegateForColumn(column)
+                    or self.table.itemDelegate()
+                )
+                delegate.initStyleOption(option, index)
+
+                available_width = max(self.table.columnWidth(column) - 16, 20)
+                metrics = QFontMetrics(option.font)
+                text_bounds = metrics.boundingRect(
+                    QRect(0, 0, available_width, 1_000_000),
+                    wrap_flags,
+                    item.text(),
+                )
+                row_height = max(row_height, text_bounds.height() + 12)
+
+            self.table.setRowHeight(row, row_height)
+
+    def _set_initial_column_widths(self, has_score):
+        """Provide readable defaults while keeping every data column interactive."""
+        widths = (
+            [42, 65, 210, 340, 190, 340, 130, 120, 120]
+            if has_score
+            else [42, 65, 210, 340, 190, 340, 90]
+        )
+        for column, width in enumerate(widths):
+            self.table.setColumnWidth(column, width)
+
+    @staticmethod
+    def _table_item(text="", flags=None):
+        """Create a consistently top-left aligned result-table item."""
+        item = QTableWidgetItem(str(text))
+        item.setTextAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        if flags is not None:
+            item.setFlags(flags)
+        return item
 
     def update_table(self, data: List[Dict]):
         """Update results table. Adds a leading checkbox column."""
@@ -522,10 +596,20 @@ class ResultsWidget(QWidget):
 
         # headers/columns (checkbox + previous layout)
         if has_score:
-            headers = ["", "Sol ID", "Step", "Resource", "Capabilities", "Weighted Energy", "Weighted Use", "Weighted CO2"]
-            self.table.setColumnCount(8)
+            headers = [
+                "",
+                "Sol ID",
+                "Step",
+                "Required Capability",
+                "Resource",
+                "Offered Capability",
+                "Weighted Energy",
+                "Weighted Use",
+                "Weighted CO2",
+            ]
+            self.table.setColumnCount(9)
         else:
-            headers = ["", "Sol ID", "Step", "Description", "Resource", "Capabilities", "Status"]
+            headers = ["", "Sol ID", "Step", "Required Capability", "Resource", "Offered Capability", "Status"]
             self.table.setColumnCount(7)
 
         self.table.setSortingEnabled(False)
@@ -534,13 +618,15 @@ class ResultsWidget(QWidget):
         self.table.clearSpans()
         self.table.setHorizontalHeaderLabels(headers)
 
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setMinimumSectionSize(40)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(0, 42)
-        cap_col_idx = 4 if has_score else 5
-        self.table.horizontalHeader().setSectionResizeMode(cap_col_idx, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionsClickable(False)
-        self.table.horizontalHeader().setSortIndicatorShown(False)
+        header.setSectionsClickable(False)
+        header.setSortIndicatorShown(False)
+        self._set_initial_column_widths(has_score)
 
         self.table.setRowCount(len(data))
 
@@ -548,8 +634,7 @@ class ResultsWidget(QWidget):
         for r, row_data in enumerate(data):
             if not row_data:
                 for c in range(self.table.columnCount()):
-                    item = QTableWidgetItem("")
-                    item.setFlags(Qt.ItemFlag.NoItemFlags)
+                    item = self._table_item("", Qt.ItemFlag.NoItemFlags)
                     self.table.setItem(r, c, item)
                 continue
 
@@ -563,27 +648,64 @@ class ResultsWidget(QWidget):
                         cb.stateChanged.connect(lambda _state: self._update_export_button_state())
                         self.table.setCellWidget(r, 0, cb)
                     else:
-                        chk_item = QTableWidgetItem()
-                        chk_item.setFlags(Qt.ItemFlag.NoItemFlags)
+                        chk_item = self._table_item("", Qt.ItemFlag.NoItemFlags)
                         self.table.setItem(r, 0, chk_item)
 
-                    self.table.setItem(r, 1, QTableWidgetItem(str(current_sol_id if current_sol_id != -1 else "")))
+                    self.table.setItem(
+                        r,
+                        1,
+                        self._table_item(
+                            current_sol_id if current_sol_id != -1 else ""
+                        ),
+                    )
                     summary = f"Solution {current_sol_id}, Total Weighted Cost = {row_data.get('composite_score', 0):.2f}"
-                    summary_item = QTableWidgetItem(summary)
-                    summary_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    summary_item = self._table_item(
+                        summary, Qt.ItemFlag.ItemIsEnabled
+                    )
                     self.table.setItem(r, 2, summary_item)
                     self.table.setSpan(r, 2, 1, self.table.columnCount() - 2)
                 else:
-                    chk_item = QTableWidgetItem()
-                    chk_item.setFlags(Qt.ItemFlag.NoItemFlags)
+                    chk_item = self._table_item("", Qt.ItemFlag.NoItemFlags)
                     self.table.setItem(r, 0, chk_item)
-                    self.table.setItem(r, 1, QTableWidgetItem(""))
-                    self.table.setItem(r, 2, QTableWidgetItem(str(row_data.get("step_id", ""))))
-                    self.table.setItem(r, 3, QTableWidgetItem(str(row_data.get("resource", ""))))
-                    self.table.setItem(r, 4, QTableWidgetItem(self._format_capabilities_text(row_data.get("capabilities", ""))))
-                    self.table.setItem(r, 5, QTableWidgetItem(f"{row_data.get('energy_cost', 0):.1f}"))
-                    self.table.setItem(r, 6, QTableWidgetItem(f"{row_data.get('use_cost', 0):.1f}"))
-                    self.table.setItem(r, 7, QTableWidgetItem(f"{row_data.get('co2_footprint', 0):.1f}"))
+                    self.table.setItem(r, 1, self._table_item(""))
+                    self.table.setItem(
+                        r, 2, self._table_item(row_data.get("step_id", ""))
+                    )
+                    self.table.setItem(
+                        r,
+                        3,
+                        self._table_item(
+                            row_data.get("required_capability")
+                            or row_data.get("description", "")
+                        ),
+                    )
+                    self.table.setItem(
+                        r,
+                        4,
+                        self._table_item(
+                            self._format_resource_text(
+                                row_data.get("resource", "")
+                            )
+                        ),
+                    )
+                    self.table.setItem(
+                        r,
+                        5,
+                        self._table_item(
+                            self._format_capabilities_text(
+                                row_data.get("capabilities", "")
+                            )
+                        ),
+                    )
+                    self.table.setItem(
+                        r, 6, self._table_item(f"{row_data.get('energy_cost', 0):.1f}")
+                    )
+                    self.table.setItem(
+                        r, 7, self._table_item(f"{row_data.get('use_cost', 0):.1f}")
+                    )
+                    self.table.setItem(
+                        r, 8, self._table_item(f"{row_data.get('co2_footprint', 0):.1f}")
+                    )
             else:
                 # checkbox: only show selectable checkbox for first row of each solution
                 if current_sol_id != last_sol_id and current_sol_id != -1:
@@ -592,20 +714,44 @@ class ResultsWidget(QWidget):
                     self.table.setCellWidget(r, 0, cb)
                     last_sol_id = current_sol_id
                 else:
-                    chk_item = QTableWidgetItem()
-                    chk_item.setFlags(Qt.ItemFlag.NoItemFlags)
+                    chk_item = self._table_item("", Qt.ItemFlag.NoItemFlags)
                     self.table.setItem(r, 0, chk_item)
 
-                self.table.setItem(r, 1, QTableWidgetItem(str(row_data.get("solution_id", ""))))
-                self.table.setItem(r, 2, QTableWidgetItem(str(row_data.get("step_id", ""))))
-                self.table.setItem(r, 3, QTableWidgetItem(str(row_data.get("description", ""))))
-                self.table.setItem(r, 4, QTableWidgetItem(str(row_data.get("resource", ""))))
-                self.table.setItem(r, 5, QTableWidgetItem(self._format_capabilities_text(row_data.get("capabilities", ""))))
-                status_item = QTableWidgetItem(str(row_data.get("status", "")))
+                self.table.setItem(
+                    r, 1, self._table_item(row_data.get("solution_id", ""))
+                )
+                self.table.setItem(
+                    r, 2, self._table_item(row_data.get("step_id", ""))
+                )
+                self.table.setItem(
+                    r,
+                    3,
+                    self._table_item(
+                        row_data.get("required_capability")
+                        or row_data.get("description", "")
+                    ),
+                )
+                self.table.setItem(
+                    r,
+                    4,
+                    self._table_item(
+                        self._format_resource_text(row_data.get("resource", ""))
+                    ),
+                )
+                self.table.setItem(
+                    r,
+                    5,
+                    self._table_item(
+                        self._format_capabilities_text(
+                            row_data.get("capabilities", "")
+                        )
+                    ),
+                )
+                status_item = self._table_item(row_data.get("status", ""))
                 status_item.setForeground(QColor("#28a745"))
                 self.table.setItem(r, 6, status_item)
 
         self.table.blockSignals(False)
-        self.table.resizeRowsToContents()
+        self._resize_result_rows()
         self.table.setSortingEnabled(False)
         self._update_export_button_state()

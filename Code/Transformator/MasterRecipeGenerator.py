@@ -2,6 +2,7 @@ import json
 import uuid
 from datetime import datetime
 import os
+import re
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
@@ -20,6 +21,7 @@ def generate_b2mml_master_recipe(
     general_recipe_data,
     selected_solution_id,
     output_path=None,
+    log_callback=None,
 ):
     """
     Generate a B2MML Master Recipe XML from in-memory data.
@@ -30,11 +32,13 @@ def generate_b2mml_master_recipe(
         general_recipe_data: General recipe data.
         selected_solution_id: The chosen optimal solution ID.
         output_path: Optional output file path. If None, returns the XML string.
+        log_callback: Optional function receiving informational export messages.
 
     Returns:
         If output_path is None: Returns XML string.
         If output_path is provided: Writes XML to file and returns the file path (or XML string on write failure).
     """
+    emit_log = log_callback if callable(log_callback) else print
 
     # --- Find the selected solution ---
     optimal_solution = None
@@ -113,36 +117,105 @@ def generate_b2mml_master_recipe(
     # Formula - Collect all parameters
     formula = create_element(master_recipe, "Formula")
 
-    # Helper: Find propertyRealizedBy from resource data
-    def find_property_realized_by(resource_name, capability_name, property_name):
-        if resource_name not in resources_data:
+    def find_selected_capability_entry(assignment):
+        resource_name = assignment.get("resource", "")
+        resource_caps = resources_data.get(resource_name)
+        if not isinstance(resource_caps, list):
             return None
 
-        resource_caps = resources_data[resource_name]
-        if isinstance(resource_caps, list):
-            for capability_data in resource_caps:
-                # Check capability name
-                cap_match = False
-                if "capability" in capability_data:
-                    for cap in capability_data["capability"]:
-                        if cap.get("capability_name") == capability_name:
-                            cap_match = True
-                            break
+        selected = assignment.get("selected_capability") or {}
+        capability_index = selected.get("index")
+        if isinstance(capability_index, int) and 0 <= capability_index < len(resource_caps):
+            indexed_entry = resource_caps[capability_index]
+            indexed_meta = (indexed_entry.get("capability") or [{}])[0]
+            selected_name = selected.get("name")
+            selected_id = selected.get("id")
+            if (
+                (not selected_name or indexed_meta.get("capability_name") == selected_name)
+                and (not selected_id or indexed_meta.get("capability_ID") == selected_id)
+            ):
+                return indexed_entry
 
-                if not cap_match:
-                    continue
+        selected_name = selected.get("name")
+        selected_id = selected.get("id")
+        if not selected_name:
+            capabilities = assignment.get("capabilities") or []
+            selected_name = capabilities[0] if len(capabilities) == 1 else None
 
-                # Search in properties
-                for prop in capability_data.get("properties", []):
-                    if prop.get("property_name") == property_name:
-                        return prop.get("propertyRealizedBy")
-
-                # Fallback: case-insensitive by property_name
-                for prop in capability_data.get("properties", []):
-                    if prop.get("property_name", "").lower() == property_name.lower():
-                        return prop.get("propertyRealizedBy")
+        for capability_data in resource_caps:
+            cap_meta = (capability_data.get("capability") or [{}])[0]
+            if selected_id and cap_meta.get("capability_ID") == selected_id:
+                return capability_data
+            if selected_name and cap_meta.get("capability_name") == selected_name:
+                return capability_data
 
         return None
+
+    def selected_capability_metadata(assignment):
+        selected = dict(assignment.get("selected_capability") or {})
+        capability_entry = find_selected_capability_entry(assignment)
+        cap_meta = (
+            (capability_entry.get("capability") or [{}])[0]
+            if isinstance(capability_entry, dict)
+            else {}
+        )
+        capabilities = assignment.get("capabilities") or []
+
+        selected.setdefault(
+            "name",
+            cap_meta.get("capability_name")
+            or (capabilities[0] if len(capabilities) == 1 else "Unknown"),
+        )
+        selected.setdefault("id", cap_meta.get("capability_ID", ""))
+        selected.setdefault(
+            "realized_by",
+            list(capability_entry.get("realized_by") or [])
+            if isinstance(capability_entry, dict)
+            else [],
+        )
+        return selected, capability_entry
+
+    # Helper: Find propertyRealizedBy only inside the selected capability.
+    def find_property_realized_by(capability_data, property_name):
+        if not isinstance(capability_data, dict):
+            return None
+
+        for prop in capability_data.get("properties", []):
+            if prop.get("property_name") == property_name:
+                return prop.get("propertyRealizedBy") or prop.get("property_realized_by")
+
+        for prop in capability_data.get("properties", []):
+            if prop.get("property_name", "").lower() == property_name.lower():
+                return prop.get("propertyRealizedBy") or prop.get("property_realized_by")
+
+        return None
+
+    def get_export_value(param):
+        values = param.get("Values")
+        if not isinstance(values, list) or not values:
+            values = [{
+                "ValueString": param.get("ValueString"),
+                "DataType": param.get("DataType"),
+                "UnitOfMeasure": param.get("UnitOfMeasure"),
+            }]
+
+        populated = [
+            value for value in values
+            if isinstance(value, dict) and value.get("ValueString") not in (None, "")
+        ]
+        if len(populated) != 1:
+            return None
+
+        raw_value = str(populated[0].get("ValueString")).strip()
+        match = re.fullmatch(r"(==|=)?\s*(.+)", raw_value)
+        if not match or raw_value.startswith((">=", "<=", ">", "<", "!=")):
+            return None
+
+        return {
+            "ValueString": match.group(2),
+            "DataType": populated[0].get("DataType") or param.get("DataType", ""),
+            "UnitOfMeasure": populated[0].get("UnitOfMeasure") or param.get("UnitOfMeasure", ""),
+        }
 
     # Map data types
     def map_data_type(json_type):
@@ -175,11 +248,14 @@ def generate_b2mml_master_recipe(
                 break
 
         if not assignment:
-            print(f"Warning: No assignment found for process element {pe.get('ID')}")
+            emit_log(f"Warning: No assignment found for process element {pe.get('ID')}")
             continue
 
         if "Parameters" not in pe:
             continue
+
+        selected_capability, selected_capability_entry = selected_capability_metadata(assignment)
+        selected_capability_name = selected_capability.get("name", "Unknown")
 
         for param in pe["Parameters"]:
             param_id = None
@@ -187,8 +263,7 @@ def generate_b2mml_master_recipe(
             # Special handling for Dosing
             if pe.get("ID") == "Dosing001" and param.get("ID") == "Dosing_Amount001":
                 property_realized_by = find_property_realized_by(
-                    assignment.get("resource", ""),
-                    "Dosing",
+                    selected_capability_entry,
                     "Litre",
                 )
                 param_id = property_realized_by
@@ -200,19 +275,35 @@ def generate_b2mml_master_recipe(
                             matched_prop.get("property_id") == param.get("Key")
                             and matched_prop.get("property_unit") == param.get("UnitOfMeasure")
                         ):
-                            property_realized_by = find_property_realized_by(
-                                assignment.get("resource", ""),
-                                capability_detail.get("capability_name", ""),
-                                matched_prop.get("property_name", ""),
+                            property_realized_by = (
+                                matched_prop.get("property_realized_by")
+                                or find_property_realized_by(
+                                    selected_capability_entry,
+                                    matched_prop.get("property_name", ""),
+                                )
                             )
                             param_id = property_realized_by
                             break
                     if param_id:
                         break
 
-            # If propertyRealizedBy not found, skip this parameter
+            # Matching properties may intentionally have no executable reference.
             if not param_id:
-                print(f"Warning: No propertyRealizedBy found for parameter {param.get('ID')}, skipping...")
+                emit_log(
+                    "Info: Parameter "
+                    f"{param.get('ID')} matched capability {selected_capability_name}, "
+                    "but is omitted from the Master Recipe because propertyRealizedBy is missing."
+                )
+                continue
+
+            export_value = get_export_value(param)
+            if export_value is None:
+                emit_log(
+                    "Info: Parameter "
+                    f"{param.get('ID')} matched capability {selected_capability_name}, "
+                    "but is omitted from the Master Recipe because it defines a range "
+                    "and no concrete setpoint was selected."
+                )
                 continue
 
             formatted_param_id = f"{global_param_counter:03d}:{param_id}"
@@ -230,14 +321,10 @@ def generate_b2mml_master_recipe(
             create_element(param_elem, "ParameterSubType").text = "ST"
 
             value_elem = create_element(param_elem, "Value")
-            value_str = param.get("ValueString", "")
-            if value_str.startswith(">=") or value_str.startswith("<="):
-                value_str = value_str[2:]
-
-            create_element(value_elem, "ValueString").text = value_str
+            create_element(value_elem, "ValueString").text = export_value["ValueString"]
             create_element(value_elem, "DataInterpretation").text = "Constant"
-            create_element(value_elem, "DataType").text = map_data_type(param.get("DataType", ""))
-            create_element(value_elem, "UnitOfMeasure").text = map_unit(param.get("UnitOfMeasure", ""))
+            create_element(value_elem, "DataType").text = map_data_type(export_value["DataType"])
+            create_element(value_elem, "UnitOfMeasure").text = map_unit(export_value["UnitOfMeasure"])
 
             global_param_counter += 1
 
@@ -264,36 +351,19 @@ def generate_b2mml_master_recipe(
                 break
 
         if not assignment:
-            print(f"Warning: No assignment found for process element {pe.get('ID')}")
+            emit_log(f"Warning: No assignment found for process element {pe.get('ID')}")
             continue
 
         resource_short = assignment.get("resource", "").replace("resource: ", "").replace("2025-04_", "")
 
-        # Capability name (from assignment)
-        capability_name = "Unknown"
-        for cap_detail in assignment.get("capability_details", []) or []:
-            if cap_detail.get("capability_name"):
-                capability_name = cap_detail["capability_name"]
-                break
+        selected_capability, _ = selected_capability_metadata(assignment)
+        capability_name = selected_capability.get("name", "Unknown")
 
-        # Find realized_by from resource data
+        # Use only the explicitly selected capability realization.
         recipe_element_id = None
-        resource_key = assignment.get("resource", "")
-        if resource_key in resources_data:
-            resource_caps = resources_data[resource_key]
-            if isinstance(resource_caps, list):
-                for capability_data in resource_caps:
-                    capabilities_matched = False
-                    for cap in capability_data.get("capability", []) or []:
-                        if cap.get("capability_name") in assignment.get("capabilities", []):
-                            capabilities_matched = True
-                            break
-
-                    if capabilities_matched and capability_data.get("realized_by"):
-                        realized_by_list = capability_data["realized_by"]
-                        if realized_by_list:
-                            recipe_element_id = f"{recipe_element_counter:03d}:{realized_by_list[0]}"
-                            break
+        realized_by_list = selected_capability.get("realized_by") or []
+        if realized_by_list:
+            recipe_element_id = f"{recipe_element_counter:03d}:{realized_by_list[0]}"
 
         # If not found, fallback to UUID
         if not recipe_element_id:
@@ -446,7 +516,7 @@ def generate_b2mml_master_recipe(
         dom = minidom.parseString(xml_bytes)
         pretty_xml = dom.toprettyxml(indent="\t", encoding="utf-8").decode("utf-8")
     except Exception as e:
-        print(f"Warning: Could not pretty-print XML: {e}")
+        emit_log(f"Warning: Could not pretty-print XML: {e}")
         pretty_xml = xml_bytes.decode("utf-8")
 
     # Save or return
@@ -454,10 +524,10 @@ def generate_b2mml_master_recipe(
         try:
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(pretty_xml)
-            print(f"Successfully saved Master Recipe to: {output_path}")
+            emit_log(f"Successfully saved Master Recipe to: {output_path}")
             return output_path
         except Exception as e:
-            print(f"Error saving file: {e}")
+            emit_log(f"Error saving file: {e}")
             return pretty_xml
 
     return pretty_xml

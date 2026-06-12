@@ -1,5 +1,7 @@
 # Code/SMT4ModPlant/SMT4ModPlant_main.py
 import json
+import math
+import re
 from z3 import Solver, Bool, Not, Sum, If, is_true, sat, And
 
 # Global constants
@@ -47,51 +49,164 @@ def capability_matching(recipe_sem_id, cap_entry):
 
     return False
 
-def property_value_match(param_value, prop):
-    import re
-    discrete_values = []
-    for k, v in prop.items():
-        if k.startswith('value') and k != 'valueType' and v is not None:
+_NUMERIC_CONSTRAINT_RE = re.compile(
+    r"^\s*(>=|<=|==|!=|>|<|=)?\s*([-+]?(?:\d+(?:[\.,]\d*)?|[\.,]\d+))\s*$"
+)
+
+
+def _parameter_values(param_or_value):
+    """Return normalized value dictionaries for legacy and multi-value parameters."""
+    if isinstance(param_or_value, dict):
+        values = param_or_value.get("Values")
+        if isinstance(values, list) and values:
+            return [value for value in values if isinstance(value, dict)]
+        return [{
+            "ValueString": param_or_value.get("ValueString"),
+            "DataType": param_or_value.get("DataType"),
+            "UnitOfMeasure": param_or_value.get("UnitOfMeasure"),
+            "Key": param_or_value.get("Key"),
+        }]
+
+    if isinstance(param_or_value, (list, tuple)):
+        return [
+            value if isinstance(value, dict) else {"ValueString": value}
+            for value in param_or_value
+        ]
+
+    return [{"ValueString": param_or_value}]
+
+
+def _parse_numeric_constraints(param_or_value):
+    constraints = []
+    for value in _parameter_values(param_or_value):
+        raw_value = value.get("ValueString")
+        if raw_value is None or str(raw_value).strip() == "":
+            continue
+        match = _NUMERIC_CONSTRAINT_RE.fullmatch(str(raw_value))
+        if not match:
+            return None
+        operator, number = match.groups()
+        constraints.append((operator or "=", float(number.replace(",", "."))))
+    return constraints
+
+
+def _discrete_property_values(prop):
+    values = []
+    for key, raw_value in prop.items():
+        if (
+            key.startswith("value")
+            and key not in {"valueType", "valueMin", "valueMax"}
+            and raw_value not in (None, "")
+        ):
             try:
-                discrete_values.append(float(v))
+                values.append(float(str(raw_value).replace(",", ".")))
             except (ValueError, TypeError):
                 continue
+    return values
 
-    value_min = prop.get('valueMin')
-    value_max = prop.get('valueMax')
 
-    if value_min is not None or value_max is not None:
-        match = re.match(r'(>=|<=|>|<|=)?\s*([0-9\.,]+)', str(param_value))
-        if match:
-            op, val = match.groups()
-            val = float(val.replace(',', '.'))
-            op = op or '='
-            if value_min is not None:
-                try:
-                    value_min_f = float(value_min)
-                    if op in ('=', '>=') and val < value_min_f: return False
-                    if op == '>' and val <= value_min_f: return False
-                except ValueError: pass
-            if value_max is not None:
-                try:
-                    value_max_f = float(value_max)
-                    if op in ('=', '<=') and val > value_max_f: return False
-                    if op == '<' and val >= value_max_f: return False
-                except ValueError: pass
-            return True
+def _optional_float(value):
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value).replace(",", "."))
+    except (ValueError, TypeError):
+        return None
 
-    if discrete_values:
-        match = re.match(r'(>=|<=|>|<|=)?\s*([0-9\.,]+)', str(param_value))
-        if match:
-            op, val = match.groups()
-            op = op or '='
-            pval = float(val.replace(',', '.'))
-            if op in ('=', None): return pval in discrete_values
-            elif op == '>=': return any(dv >= pval for dv in discrete_values)
-            elif op == '<=': return any(dv <= pval for dv in discrete_values)
-            elif op == '>': return any(dv > pval for dv in discrete_values)
-            elif op == '<': return any(dv < pval for dv in discrete_values)
+
+def _value_satisfies_constraints(value, constraints):
+    for operator, required in constraints:
+        if operator in ("=", "==") and value != required:
+            return False
+        if operator == "!=" and value == required:
+            return False
+        if operator == ">=" and value < required:
+            return False
+        if operator == ">" and value <= required:
+            return False
+        if operator == "<=" and value > required:
+            return False
+        if operator == "<" and value >= required:
+            return False
+    return True
+
+
+def _ranges_intersect_constraints(resource_min, resource_max, constraints):
+    lower = -math.inf if resource_min is None else resource_min
+    upper = math.inf if resource_max is None else resource_max
+    lower_inclusive = resource_min is not None
+    upper_inclusive = resource_max is not None
+    exact_value = None
+    excluded_values = set()
+
+    for operator, required in constraints:
+        if operator in ("=", "=="):
+            if exact_value is not None and exact_value != required:
+                return False
+            exact_value = required
+        elif operator == "!=":
+            excluded_values.add(required)
+        elif operator in (">", ">="):
+            inclusive = operator == ">="
+            if required > lower:
+                lower = required
+                lower_inclusive = inclusive
+            elif required == lower:
+                lower_inclusive = lower_inclusive and inclusive
+        elif operator in ("<", "<="):
+            inclusive = operator == "<="
+            if required < upper:
+                upper = required
+                upper_inclusive = inclusive
+            elif required == upper:
+                upper_inclusive = upper_inclusive and inclusive
+
+    if exact_value is not None:
+        if exact_value in excluded_values:
+            return False
+        if exact_value < lower or exact_value > upper:
+            return False
+        if exact_value == lower and not lower_inclusive:
+            return False
+        if exact_value == upper and not upper_inclusive:
+            return False
+        return True
+
+    if lower < upper:
+        return True
+    if lower > upper:
         return False
+    return lower_inclusive and upper_inclusive and lower not in excluded_values
+
+
+def property_value_match(param_value, prop):
+    """
+    Check whether a property offers at least one value satisfying all recipe constraints.
+
+    ``param_value`` accepts both the legacy scalar value and a full parameter dictionary
+    containing the new ``Values`` list.
+    """
+    constraints = _parse_numeric_constraints(param_value)
+    if constraints is None:
+        return False
+    if not constraints:
+        return True
+
+    discrete_values = _discrete_property_values(prop)
+    if discrete_values:
+        return any(
+            _value_satisfies_constraints(value, constraints)
+            for value in discrete_values
+        )
+
+    has_range = "valueMin" in prop or "valueMax" in prop
+    if has_range:
+        return _ranges_intersect_constraints(
+            _optional_float(prop.get("valueMin")),
+            _optional_float(prop.get("valueMax")),
+            constraints,
+        )
+
     return True
 
 def properties_compatible(recipe_step, cap_entry):
@@ -99,18 +214,30 @@ def properties_compatible(recipe_step, cap_entry):
         return True, []
     matched_props = []
     for param in recipe_step["Parameters"]:
-        param_key = param.get("Key")
-        param_unit = param.get("UnitOfMeasure")
-        value_str = param.get("ValueString")
+        param_values = _parameter_values(param)
+        param_keys = {
+            value.get("Key") for value in param_values if value.get("Key")
+        } or {param.get("Key")}
+        param_units = {
+            value.get("UnitOfMeasure")
+            for value in param_values
+            if value.get("UnitOfMeasure")
+        } or {param.get("UnitOfMeasure")}
         match_found = False
         for prop in cap_entry.get("properties", []):
-            if prop.get("property_ID") == param_key:
-                if param_unit and prop.get("property_unit") and param_unit != prop.get("property_unit"):
-                    continue
-                if property_value_match(value_str, prop):
-                    matched_props.append((param, prop))
-                    match_found = True
-                    break
+            if any(key and prop.get("property_ID") != key for key in param_keys):
+                continue
+            if any(
+                unit
+                and prop.get("property_unit")
+                and prop.get("property_unit") != unit
+                for unit in param_units
+            ):
+                continue
+            if property_value_match(param, prop):
+                matched_props.append((param, prop))
+                match_found = True
+                break
         if not match_found:
             return False, []
     return True, matched_props
@@ -126,6 +253,9 @@ def _summarize_matched_properties(matched_props):
             "parameter_key": param.get("Key"),
             "parameter_unit": param.get("UnitOfMeasure"),
             "parameter_value": param.get("ValueString"),
+            "parameter_values": [
+                value.get("ValueString") for value in _parameter_values(param)
+            ],
             "property_id": prop.get("property_ID"),
             "property_name": prop.get("property_name"),
             "property_unit": prop.get("property_unit"),
@@ -147,6 +277,7 @@ def _analyze_capability_match(recipe_data, step, cap_entry):
     cap_meta = (cap_entry.get("capability") or [{}])[0]
     cap_name = cap_meta.get("capability_name", "Unknown")
     cap_id = cap_meta.get("capability_ID", "")
+    is_assignable = cap_entry.get("is_assignable", True) is not False
 
     semantic_match = capability_matching(sem_id, cap_entry)
     properties_match = False
@@ -162,6 +293,10 @@ def _analyze_capability_match(recipe_data, step, cap_entry):
     debug_entry = {
         "capability_name": cap_name,
         "capability_id": cap_id,
+        "is_assignable": is_assignable,
+        "assignment_exclusion_reason": (
+            None if is_assignable else "not_assigned"
+        ),
         "semantic_match": semantic_match,
         "properties_match": properties_match,
         "preconditions_match": preconditions_match,
@@ -203,165 +338,224 @@ def check_preconditions_for_step(recipe, step, cap_entry):
                 if not matched: return False
     return True
 
-def has_transfer_capability(res, capabilities_data):
-    if res not in capabilities_data: return False
-    for cap in capabilities_data[res]:
-        if cap['capability'][0]['capability_name'] in TRANSPORT_CAPABILITIES: return True
-    return False
+def _selected_candidate(model, candidates):
+    for candidate in candidates:
+        if is_true(model[candidate["var"]]):
+            return candidate
+    return None
 
-def needs_transfer_to_step(step, current_res_idx, resources, step_by_id, step_resource_to_caps_props, recipe):
-    step_id = step['ID']
-    links = recipe.get('DirectedLinks', [])
-    for link in links:
-        if link.get('ToID') == step_id:
-            from_id = link['FromID']
-            for idx, candidate_step in enumerate(recipe['ProcessElements']):
-                if candidate_step['ID'] == from_id:
-                    for k, _ in enumerate(resources):
-                        if k != current_res_idx:
-                            entry = step_resource_to_caps_props[idx][k]
-                            if entry and isinstance(entry, tuple) and len(entry) > 0:
-                                return True
-    return False
 
-def is_materialflow_consistent(model, step_resource_to_caps_props, process_steps, resources, recipe, Assignment):
+def is_materialflow_consistent(model, Assignment, process_steps, recipe):
     material_location = {inp['ID']: None for inp in recipe.get('Inputs', [])}
     material_location.update({interm['ID']: None for interm in recipe.get('Intermediates', [])})
     material_location.update({out['ID']: None for out in recipe.get('Outputs', [])})
-        
+
     step_by_id = {step['ID']: idx for idx, step in enumerate(process_steps)}
-    resource_map = {}
-    
+    selected_by_step = {}
+
     for i, step in enumerate(process_steps):
-        for j, res in enumerate(resources):
-            var = Assignment[i][j]
-            if var is not None and is_true(model[var]):
-                resource_map[step['ID']] = res
-                
+        candidate = _selected_candidate(model, Assignment[i])
+        if candidate is not None:
+            selected_by_step[step['ID']] = candidate
+
     for link in recipe.get('DirectedLinks', []):
         from_id = link['FromID']
         to_id = link['ToID']
-        
+
         if from_id in step_by_id and to_id in material_location:
-            if from_id not in resource_map: return False 
-            res_of_step = resource_map[from_id]
-            step_idx = step_by_id[from_id]
-            res_idx = resources.index(res_of_step)
-            caps, _ = step_resource_to_caps_props[step_idx][res_idx]
-            is_transfer = any(c in TRANSPORT_CAPABILITIES for c in caps)
-            if is_transfer: material_location[to_id] = None 
-            else: material_location[to_id] = res_of_step
-            continue
-            
-        if from_id in material_location and to_id in step_by_id:
-            if to_id not in resource_map: return False
-            assigned_res = resource_map[to_id]
-            from_res = material_location[from_id]
-            step_idx = step_by_id[to_id]
-            res_idx = resources.index(assigned_res)
-            caps, _ = step_resource_to_caps_props[step_idx][res_idx]
-            is_transfer = any(c in TRANSPORT_CAPABILITIES for c in caps)
-            if is_transfer:
-                if from_res is None: pass
-                elif from_res != assigned_res: return False
+            candidate = selected_by_step.get(from_id)
+            if candidate is None:
+                return False
+            if candidate["capability_name"] in TRANSPORT_CAPABILITIES:
+                material_location[to_id] = None
             else:
-                if from_res is not None and from_res != assigned_res: return False
+                material_location[to_id] = candidate["resource"]
+            continue
+
+        if from_id in material_location and to_id in step_by_id:
+            candidate = selected_by_step.get(to_id)
+            if candidate is None:
+                return False
+            assigned_res = candidate["resource"]
+            from_res = material_location[from_id]
+            if candidate["capability_name"] in TRANSPORT_CAPABILITIES:
+                if from_res is not None and from_res != assigned_res:
+                    return False
+            else:
+                if from_res is not None and from_res != assigned_res:
+                    return False
                 material_location[from_id] = assigned_res
     return True
 
-def solution_to_json(model, process_steps, resources, step_resource_to_caps_props, Assignment, recipe, capabilities, solution_id):
+
+def _property_realized_by(prop):
+    return prop.get("propertyRealizedBy") or prop.get("property_realized_by") or ""
+
+
+def solution_to_json(model, process_steps, Assignment, solution_id):
     """Convert the solution to JSON format"""
     solution_data = {
         "solution_id": solution_id,
         "assignments": [],
         "material_flow_consistent": True
     }
-    
+
     for i, step in enumerate(process_steps):
-        for j, res in enumerate(resources):
-            var = Assignment[i][j]
-            if var is not None and is_true(model[var]):
-                caps, cap_prop_pairs = step_resource_to_caps_props[i][j]
-                
-                assignment_info = {
-                    "step_id": step['ID'],
-                    "step_description": step['Description'],
-                    "resource": res,
-                    "capabilities": caps,
-                    "parameter_matches": []
-                }
-                
-                if "Parameters" in step and step["Parameters"]:
-                    for param in step["Parameters"]:
-                        param_info = {
-                            "description": param.get('Description'),
-                            "key": param.get('Key'),
-                            "unit": param.get('UnitOfMeasure'),
-                            "value": param.get('ValueString')
-                        }
-                        assignment_info["parameter_matches"].append(param_info)
-                
-                capability_details = []
-                for cap_name, matched_props in cap_prop_pairs:
-                    cap_info = {"capability_name": cap_name, "matched_properties": []}
-                    for param, prop in matched_props:
-                        prop_info = {
-                            "property_id": prop.get('property_ID'),
-                            "property_name": prop.get('property_name'),
-                            "property_unit": prop.get('property_unit'),
-                        }
-                        discrete_values = []
-                        for key in prop.keys():
-                            if key.startswith('value') and key not in ['valueType', 'valueMin', 'valueMax']:
-                                val = prop.get(key)
-                                if val is not None:
-                                    try: discrete_values.append(float(val))
-                                    except (ValueError, TypeError): discrete_values.append(val)
-                        
-                        value_min = prop.get('valueMin')
-                        value_max = prop.get('valueMax')
-                        
-                        if discrete_values:
-                            if len(discrete_values) == 1:
-                                prop_info["value"] = discrete_values[0]
-                                prop_info["value_type"] = "exact"
-                            else:
-                                prop_info["values"] = discrete_values
-                                prop_info["value_type"] = "discrete_set"
-                        elif value_min is not None or value_max is not None:
-                            prop_info["value_min"] = value_min
-                            prop_info["value_max"] = value_max
-                            prop_info["value_type"] = "range"
-                        else:
-                            prop_info["value_type"] = "unspecified"
-                        cap_info["matched_properties"].append(prop_info)
-                    capability_details.append(cap_info)
-                
-                assignment_info["capability_details"] = capability_details
-                solution_data["assignments"].append(assignment_info)
+        candidate = _selected_candidate(model, Assignment[i])
+        if candidate is None:
+            continue
+
+        assignment_info = {
+            "step_id": step['ID'],
+            "step_description": step['Description'],
+            "resource": candidate["resource"],
+            "capabilities": [candidate["capability_name"]],
+            "selected_capability": {
+                "index": candidate["capability_index"],
+                "name": candidate["capability_name"],
+                "id": candidate["capability_id"],
+                "realized_by": list(candidate["realized_by"]),
+            },
+            "parameter_matches": []
+        }
+
+        for param in step.get("Parameters", []):
+            assignment_info["parameter_matches"].append({
+                "description": param.get('Description'),
+                "key": param.get('Key'),
+                "unit": param.get('UnitOfMeasure'),
+                "value": param.get('ValueString'),
+                "values": [
+                    value.get("ValueString") for value in _parameter_values(param)
+                ],
+            })
+
+        cap_info = {
+            "capability_name": candidate["capability_name"],
+            "capability_id": candidate["capability_id"],
+            "capability_index": candidate["capability_index"],
+            "matched_properties": [],
+        }
+        for param, prop in candidate["matched_props"]:
+            prop_info = {
+                "property_id": prop.get('property_ID'),
+                "property_name": prop.get('property_name'),
+                "property_unit": prop.get('property_unit'),
+                "property_realized_by": _property_realized_by(prop),
+            }
+            discrete_values = _discrete_property_values(prop)
+            value_min = prop.get('valueMin')
+            value_max = prop.get('valueMax')
+
+            if discrete_values:
+                if len(discrete_values) == 1:
+                    prop_info["value"] = discrete_values[0]
+                    prop_info["value_type"] = "exact"
+                else:
+                    prop_info["values"] = discrete_values
+                    prop_info["value_type"] = "discrete_set"
+            elif "valueMin" in prop or "valueMax" in prop:
+                prop_info["value_min"] = value_min
+                prop_info["value_max"] = value_max
+                prop_info["value_type"] = "range"
+            else:
+                prop_info["value_type"] = "unspecified"
+            cap_info["matched_properties"].append(prop_info)
+
+        assignment_info["capability_details"] = [cap_info]
+        solution_data["assignments"].append(assignment_info)
     return solution_data
 
+
+def _parameter_requirement_text(param):
+    values = [
+        str(value.get("ValueString")).strip()
+        for value in _parameter_values(param)
+        if value.get("ValueString") not in (None, "")
+    ]
+    return " & ".join(values) if values else "?"
+
+
+def _display_unit(unit):
+    """Return a compact unit label for plain values and URI-based units."""
+    if unit in (None, ""):
+        return ""
+
+    label = str(unit).strip().rstrip("/")
+    if "#" in label:
+        label = label.rsplit("#", 1)[-1]
+    if "/" in label:
+        label = label.rsplit("/", 1)[-1]
+    return label
+
+
+def _unit_suffix(unit):
+    label = _display_unit(unit)
+    return f" [{label}]" if label else ""
+
+
+def _parameter_unit(param):
+    for value in _parameter_values(param):
+        unit = value.get("UnitOfMeasure")
+        if unit not in (None, ""):
+            return unit
+    return param.get("UnitOfMeasure", "")
+
+
+def format_required_capability(step):
+    """Format a process step and all requested parameters for the result table."""
+    step_description = step.get("Description") or step.get("ID") or "Process step"
+    lines = [str(step_description)]
+
+    for param in step.get("Parameters", []):
+        parameter_id = param.get("ID") or "Parameter"
+        requirement = _parameter_requirement_text(param)
+        lines.append(
+            f"    {parameter_id}: {requirement}{_unit_suffix(_parameter_unit(param))}"
+        )
+
+    return "\n".join(lines)
+
+
 def format_capability_string(cap_prop_pairs):
+    """Format only the values offered by the selected resource capability."""
     display_parts = []
-    for cap_name, matched_props in cap_prop_pairs:
+    for cap_name, offered_props in cap_prop_pairs:
         param_strs = []
-        for param, prop in matched_props:
-            req_val = param.get('ValueString', '?')
-            param_desc = param.get('Description', 'Param').split(' ')[0] 
+        for property_entry in offered_props:
+            if (
+                isinstance(property_entry, (list, tuple))
+                and len(property_entry) == 2
+            ):
+                param, prop = property_entry
+            else:
+                param, prop = {}, property_entry
+
+            if not isinstance(prop, dict):
+                continue
+
+            param_desc = prop.get("property_name") or param.get("ID") or "Parameter"
             res_val = "?"
             v_min = prop.get('valueMin')
             v_max = prop.get('valueMax')
-            discrete_vals = []
-            for k, v in prop.items():
-                if k.startswith('value') and k not in ['valueType', 'valueMin', 'valueMax'] and v is not None:
-                    discrete_vals.append(str(v))
-            if v_min is not None or v_max is not None:
-                res_val = f"[{v_min or '-inf'} - {v_max or 'inf'}]"
+            discrete_vals = [
+                str(value)
+                for key, value in prop.items()
+                if key.startswith("value")
+                and key not in {"valueType", "valueMin", "valueMax"}
+                and value not in (None, "")
+            ]
+            if "valueMin" in prop or "valueMax" in prop:
+                lower_bound = "-inf" if v_min in (None, "") else str(v_min)
+                upper_bound = "inf" if v_max in (None, "") else str(v_max)
+                res_val = f"{lower_bound} -> {upper_bound}"
             elif discrete_vals:
-                res_val = f"{{{','.join(discrete_vals)}}}"
-            param_strs.append(f"{param_desc}: {req_val} -> {res_val}")
+                res_val = f"{{{', '.join(discrete_vals)}}}"
+            param_strs.append(
+                f"    {param_desc}: {res_val}{_unit_suffix(prop.get('property_unit'))}"
+            )
         if param_strs:
-            display_parts.append(f"{cap_name} ({', '.join(param_strs)})")
+            display_parts.append("\n".join([cap_name, *param_strs]))
         else:
             display_parts.append(cap_name)
     return "\n".join(display_parts)
@@ -382,23 +576,24 @@ def _match_step_to_resource_caps(
     capabilities_data,
 ):
     """
-    Collect matching capabilities and their matched properties for a given (step, resource).
+    Collect concrete capability candidates for a given (step, resource).
 
     Returns:
-        matching_caps: list[str]  - capability names that match this step
-        matching_props: list[tuple[str, dict]] - (capability_name, matched_props_local)
+        candidates: list[dict] - one entry per matching capability
         capability_debug: list[dict] - capability-by-capability diagnostics
     """
     cap_list = capabilities_data[res]
 
-    matching_caps = []
-    matching_props = []
+    candidates = []
     capability_debug = []
 
-    for cap_entry in cap_list:
+    for capability_index, cap_entry in enumerate(cap_list):
         cap_debug, matched_props_local = _analyze_capability_match(recipe_data, step, cap_entry)
+        cap_debug["capability_index"] = capability_index
         capability_debug.append(cap_debug)
 
+        if not cap_debug["is_assignable"]:
+            continue
         if not cap_debug["semantic_match"]:
             continue
         if not cap_debug["properties_match"]:
@@ -406,11 +601,16 @@ def _match_step_to_resource_caps(
         if not cap_debug["preconditions_match"]:
             continue
 
-        cap_name = cap_debug["capability_name"]
-        matching_caps.append(cap_name)
-        matching_props.append((cap_name, matched_props_local))
+        candidates.append({
+            "capability_index": capability_index,
+            "capability_name": cap_debug["capability_name"],
+            "capability_id": cap_debug["capability_id"],
+            "realized_by": list(cap_entry.get("realized_by") or []),
+            "matched_props": matched_props_local,
+            "offered_props": list(cap_entry.get("properties") or []),
+        })
 
-    return matching_caps, matching_props, capability_debug
+    return candidates, capability_debug
 
 
 def _build_model_and_assignments(
@@ -421,49 +621,32 @@ def _build_model_and_assignments(
 ):
     """
     Build the SMT model skeleton:
-      - Create assignment Bool variables assign_{stepID}_r{j}_{resource}
-      - Pre-eliminate invalid (step, resource) pairs by forcing Not(var)
-      - Store matching caps/props for later reporting + material-flow checking
+      - Create assignment Bool variables for (step, resource, capability)
+      - Keep every matching capability as a distinct selectable candidate
+      - Store candidate metadata for reporting, export, and material-flow checks
 
     Returns:
         solver: z3.Solver
-        Assignment: 2D list of Bool or None (None means impossible assignment)
-        step_resource_to_caps_props: 2D list storing (matching_caps, matching_props)
+        Assignment: list[list[candidate dict]]
         matching_debug: list[dict] storing per-step/per-resource debug data
     """
     solver = Solver()
-    step_by_id = {step["ID"]: idx for idx, step in enumerate(process_steps)}
-
-    step_resource_to_caps_props = [[[] for _ in resources] for _ in process_steps]
     Assignment = []
     matching_debug = []
 
     for i, step in enumerate(process_steps):
-        row = []
+        step_candidates = []
 
         for j, res in enumerate(resources):
-            matching_caps, matching_props, capability_debug = _match_step_to_resource_caps(
+            candidates, capability_debug = _match_step_to_resource_caps(
                 recipe_data=recipe_data,
                 step=step,
                 res=res,
                 capabilities_data=capabilities_data,
             )
 
-            # Create a stable and collision-resistant variable name.
-            varname = f"assign_{step['ID']}_r{j}_{_sanitize_resource_name(res)}"
-            var = Bool(varname)
-
-            # Transfer feasibility is checked here as an early pruning rule:
-            # If a step might require transport, resources without transport capability are invalid.
-            transfer_needed = needs_transfer_to_step(
-                step, j, resources, step_by_id, step_resource_to_caps_props, recipe_data
-            )
-            transfer_cap = has_transfer_capability(res, capabilities_data)
-
             invalid_reasons = []
-            if transfer_needed and not transfer_cap:
-                invalid_reasons.append("transfer_required_but_capability_missing")
-            if not matching_caps:
+            if not candidates:
                 invalid_reasons.append("no_capability_match")
 
             valid = len(invalid_reasons) == 0
@@ -475,34 +658,40 @@ def _build_model_and_assignments(
                 "step_semantic_description": step.get("SemanticDescription"),
                 "resource_index": j,
                 "resource": res,
-                "transfer_needed": transfer_needed,
-                "transfer_capability_available": transfer_cap,
                 "candidate_valid": valid,
                 "invalid_reasons": invalid_reasons,
-                "matched_capabilities": matching_caps,
+                "matched_capabilities": [
+                    candidate["capability_name"] for candidate in candidates
+                ],
                 "capability_checks": capability_debug,
             })
 
-            if valid:
-                step_resource_to_caps_props[i][j] = (matching_caps, matching_props)
-                row.append(var)
-            else:
-                # Mark as impossible and add hard constraint to forbid it.
-                row.append(None)
-                solver.add(Not(var))
+            for candidate in candidates:
+                capability_index = candidate["capability_index"]
+                varname = (
+                    f"assign_{step['ID']}_r{j}_c{capability_index}_"
+                    f"{_sanitize_resource_name(res)}"
+                )
+                step_candidates.append({
+                    **candidate,
+                    "step_index": i,
+                    "resource_index": j,
+                    "resource": res,
+                    "var": Bool(varname),
+                })
 
-        Assignment.append(row)
+        Assignment.append(step_candidates)
 
-    return solver, Assignment, step_resource_to_caps_props, matching_debug
+    return solver, Assignment, matching_debug
 
 
-def _add_exactly_one_resource_per_step_constraints(solver, Assignment):
+def _add_exactly_one_candidate_per_step_constraints(solver, Assignment):
     """
     Enforce that each process step is executed on exactly one resource.
     If a step has zero candidates, the model becomes UNSAT immediately.
     """
-    for step_vars in Assignment:
-        vars_for_step = [v for v in step_vars if v is not None]
+    for step_candidates in Assignment:
+        vars_for_step = [candidate["var"] for candidate in step_candidates]
         if vars_for_step:
             solver.add(Sum([If(v, 1, 0) for v in vars_for_step]) == 1)
         else:
@@ -516,10 +705,11 @@ def _block_current_solution(solver, Assignment, model):
     We block the conjunction of all variables that were True in this solution.
     """
     true_vars = []
-    for row in Assignment:
-        for v in row:
-            if v is not None and is_true(model[v]):
-                true_vars.append(v)
+    for candidates in Assignment:
+        for candidate in candidates:
+            var = candidate["var"]
+            if is_true(model[var]):
+                true_vars.append(var)
 
     if true_vars:
         solver.add(Not(And(true_vars)))
@@ -529,10 +719,8 @@ def _append_solution_results_for_gui(
     all_results_for_gui,
     solution_id,
     process_steps,
-    resources,
     Assignment,
     model,
-    step_resource_to_caps_props,
 ):
     """
     Convert one model solution into GUI rows and append into all_results_for_gui.
@@ -542,20 +730,24 @@ def _append_solution_results_for_gui(
         all_results_for_gui.append({})
 
     for i, step in enumerate(process_steps):
-        for j, res in enumerate(resources):
-            var = Assignment[i][j]
-            if var is not None and is_true(model[var]):
-                _, cap_prop_pairs = step_resource_to_caps_props[i][j]
-                formatted_cap_str = format_capability_string(cap_prop_pairs)
+        candidate = _selected_candidate(model, Assignment[i])
+        if candidate is None:
+            continue
+        formatted_cap_str = format_capability_string([(
+            candidate["capability_name"],
+            candidate["offered_props"],
+        )])
 
-                all_results_for_gui.append({
-                    "solution_id": solution_id,
-                    "step_id": step["ID"],
-                    "description": step["Description"],
-                    "resource": res,
-                    "capabilities": formatted_cap_str,
-                    "status": "Matched"
-                })
+        all_results_for_gui.append({
+            "solution_id": solution_id,
+            "step_id": step["ID"],
+            "description": step["Description"],
+            "required_capability": format_required_capability(step),
+            "resource": candidate["resource"],
+            "capability_name": candidate["capability_name"],
+            "capabilities": formatted_cap_str,
+            "status": "Matched"
+        })
 
 
 def run_optimization(recipe_data, capabilities_data, log_callback=print, generate_json=False, find_all_solutions=True):
@@ -578,15 +770,15 @@ def run_optimization(recipe_data, capabilities_data, log_callback=print, generat
     log_callback(f"Starting optimization (Find All: {find_all_solutions})...")
 
     # 1) Build model + assignment variables with early pruning rules.
-    solver, Assignment, step_resource_to_caps_props, matching_debug = _build_model_and_assignments(
+    solver, Assignment, matching_debug = _build_model_and_assignments(
         recipe_data=recipe_data,
         capabilities_data=capabilities_data,
         process_steps=process_steps,
         resources=resources,
     )
 
-    # 2) Add core "exactly one resource per step" constraints.
-    _add_exactly_one_resource_per_step_constraints(solver, Assignment)
+    # 2) Select exactly one concrete resource/capability candidate per step.
+    _add_exactly_one_candidate_per_step_constraints(solver, Assignment)
 
     try:
         smt_model = solver.to_smt2()
@@ -612,15 +804,14 @@ def run_optimization(recipe_data, capabilities_data, log_callback=print, generat
 
         # Additional semantic/material-flow filter (outside SMT constraints).
         if is_materialflow_consistent(
-            model, step_resource_to_caps_props, process_steps, resources, recipe_data, Assignment
+            model, Assignment, process_steps, recipe_data
         ):
             valid_solution_count += 1
             log_callback(f"Solution {valid_solution_count} Found (Attempt {attempt_count})!")
 
             if generate_json:
                 solution_json = solution_to_json(
-                    model, process_steps, resources, step_resource_to_caps_props,
-                    Assignment, recipe_data, capabilities_data, valid_solution_count
+                    model, process_steps, Assignment, valid_solution_count
                 )
                 all_json_solutions.append(solution_json)
 
@@ -628,10 +819,8 @@ def run_optimization(recipe_data, capabilities_data, log_callback=print, generat
                 all_results_for_gui=all_results_for_gui,
                 solution_id=valid_solution_count,
                 process_steps=process_steps,
-                resources=resources,
                 Assignment=Assignment,
                 model=model,
-                step_resource_to_caps_props=step_resource_to_caps_props,
             )
 
             if not find_all_solutions:

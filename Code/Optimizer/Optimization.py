@@ -126,6 +126,8 @@ class SolutionOptimizer:
             evaluated_solutions.append(cost_result)
         
         # Sort by composite score (Lower is better/optimal)
-        evaluated_solutions.sort(key=lambda x: x["composite_score"])
+        evaluated_solutions.sort(
+            key=lambda x: (x["composite_score"], x["solution_id"])
+        )
         
         return evaluated_solutions

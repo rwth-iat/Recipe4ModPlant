@@ -1,10 +1,11 @@
 # Code/GUI/Home.py
 import os
 import sys
-from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
+from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QProgressBar, QFrame, QSizePolicy, QScrollArea, QApplication, QLabel
+    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QProgressBar, QFrame,
+    QSizePolicy, QScrollArea, QApplication, QLabel, QSplitter
 )
 from qfluentwidgets import (
     CardWidget, IconWidget, BodyLabel, CaptionLabel, 
@@ -117,18 +118,26 @@ class HomePage(QWidget):
         self._init_left_panel_content()
         
         self.left_scroll.setWidget(self.left_container)
-        self.main_layout.addWidget(self.left_scroll, 1)
-
         # Right Panel (Results)
         self.right_container = QWidget(self)
-        self.right_container.setFixedWidth(0) 
         self.right_layout = QVBoxLayout(self.right_container)
         self.right_layout.setContentsMargins(0, 30, 30, 30)
         
         self.results_widget = ResultsWidget(self)
         self.right_layout.addWidget(self.results_widget)
-        
-        self.main_layout.addWidget(self.right_container, 0)
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.splitter.setHandleWidth(10)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.addWidget(self.left_scroll)
+        self.splitter.addWidget(self.right_container)
+        self.splitter.setCollapsible(1, True)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 1)
+        self.right_container.setVisible(False)
+        self.splitter.setSizes([1, 0])
+
+        self.main_layout.addWidget(self.splitter)
 
     def _init_left_panel_content(self):
         """Create the configuration cards on the left side (file pickers, mode, weights)."""
@@ -356,32 +365,19 @@ class HomePage(QWidget):
         self.anim.start()
 
     def toggle_results_panel(self, show=True):
-        """Slide the results panel open/closed by animating its width."""
-        parent_width = self.width()
-        target_width = parent_width // 2 if show else 0
-        start_width = self.right_container.width()
-        
-        if start_width == target_width:
-            return
+        """Show or hide results while preserving manual splitter resizing."""
+        current_sizes = self.splitter.sizes()
+        total_width = max(sum(current_sizes), self.splitter.width(), self.width(), 1)
 
-        self.split_anim = QPropertyAnimation(self.right_container, b"minimumWidth")
-        self.split_anim.setDuration(500) 
-        self.split_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        
-        self.split_anim.setStartValue(start_width)
-        self.split_anim.setEndValue(target_width)
-        
-        self.split_anim_max = QPropertyAnimation(self.right_container, b"maximumWidth")
-        self.split_anim_max.setDuration(500)
-        self.split_anim_max.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self.split_anim_max.setStartValue(start_width)
-        self.split_anim_max.setEndValue(target_width)
-        
-        self.group = QParallelAnimationGroup()
-        self.group.addAnimation(self.split_anim)
-        self.group.addAnimation(self.split_anim_max)
-        
-        self.group.start()
+        if show:
+            if self.right_container.isVisible() and current_sizes[1] > 0:
+                return
+            self.right_container.setVisible(True)
+            left_width = total_width // 2
+            self.splitter.setSizes([left_width, total_width - left_width])
+        else:
+            self.splitter.setSizes([total_width, 0])
+            self.right_container.setVisible(False)
 
     # -----------------------------------------------------
     # Logic: Mode Selection
@@ -565,7 +561,5 @@ class HomePage(QWidget):
         InfoBar.error(title="Error", content=err_msg, parent=self, position=InfoBarPosition.TOP_RIGHT)
 
     def resizeEvent(self, event):
-        """Keep the split layout responsive when the window size changes."""
-        if self.right_container.width() > 0:
-             self.right_container.setFixedWidth(self.width() // 2)
+        """Let QSplitter preserve the panel ratio chosen by the user."""
         super().resizeEvent(event)

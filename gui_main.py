@@ -32,7 +32,7 @@ class MainWindow(FluentWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Plant Configurator and Master Recipe Generator")
+        self.setWindowTitle("Recipe4ModPlant")
         setTheme(Theme.DARK)
         self.resize(1200, 800) # Initial window size
         

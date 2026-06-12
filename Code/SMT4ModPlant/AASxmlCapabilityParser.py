@@ -5,6 +5,43 @@ import os
 import io
 from pathlib import Path
 
+
+def _parse_capability_qualifiers(capability_element, ns):
+    """Extract capability role qualifiers and derive direct assignability."""
+    qualifiers = []
+    is_assignable = True
+
+    for qualifier in capability_element.findall(
+        "aas:qualifiers/aas:qualifier", ns
+    ):
+        qualifier_type = qualifier.findtext("aas:type", default="", namespaces=ns)
+        qualifier_value = qualifier.findtext(
+            "aas:value", default="", namespaces=ns
+        )
+        qualifier_entry = {
+            "kind": qualifier.findtext("aas:kind", default="", namespaces=ns),
+            "type": qualifier_type,
+            "value_type": qualifier.findtext(
+                "aas:valueType", default="", namespaces=ns
+            ),
+            "value": qualifier_value,
+            "semantic_ids": [
+                value.text
+                for value in qualifier.findall("aas:semanticId//aas:value", ns)
+                if value.text
+            ],
+        }
+        qualifiers.append(qualifier_entry)
+
+        if (
+            qualifier_type.strip().lower() == "notassigned"
+            and qualifier_value.strip().lower() in {"true", "1"}
+        ):
+            is_assignable = False
+
+    return qualifiers, is_assignable
+
+
 def parse_capabilities_robust(file_path):
     """
     Parse an AAS file (XML, AASX, or JSON via basyx) and extract capabilities.
@@ -116,12 +153,19 @@ def _extract_capabilities_from_etree(tree: ET.ElementTree):
                             capability_element_name = capability_element.find("aas:idShort", ns)
                             capability_element_reference = capability_element.find("aas:supplementalSemanticIds//aas:value", ns)
                             capability_comment = capability_container.find("aas:value/aas:multiLanguageProperty/aas:value//aas:text", ns)
+                            capability_qualifiers, is_assignable = (
+                                _parse_capability_qualifiers(
+                                    capability_element, ns
+                                )
+                            )
                             
                             capability = {
                                 'capability': [],
                                 'properties': [],
                                 'generalized_by': [],
-                                'realized_by': []
+                                'realized_by': [],
+                                'capability_qualifiers': capability_qualifiers,
+                                'is_assignable': is_assignable,
                             }
 
                             capability['capability'].append({
@@ -135,6 +179,63 @@ def _extract_capabilities_from_etree(tree: ET.ElementTree):
                                 property_sets_value = property_sets.find(".//aas:value", ns)
                                 if property_sets_value is not None and "https://admin-shell.io/idta/CapabilityDescription/PropertySet/1/0" in property_sets_value.text:
                                     for property_container in property_sets.findall(".//aas:submodelElementCollection", ns):
+
+                                        # Scalar Properties
+                                        property_type_scalar = property_container.find(
+                                            "aas:value/aas:property", ns
+                                        )
+                                        if property_type_scalar is not None:
+                                            prop_name = property_type_scalar.find("aas:idShort", ns)
+                                            prop_id = property_type_scalar.find(
+                                                "aas:supplementalSemanticIds//aas:value", ns
+                                            )
+                                            unit = property_type_scalar.find(
+                                                "aas:embeddedDataSpecifications//aas:value", ns
+                                            )
+                                            vtype = property_type_scalar.find("aas:valueType", ns)
+                                            scalar_value = property_type_scalar.find("aas:value", ns)
+                                            prop_comment = property_container.find(
+                                                "aas:value/aas:multiLanguageProperty/"
+                                                "aas:value//aas:text",
+                                                ns,
+                                            )
+                                            prop_rel_by = property_container.find(
+                                                "aas:value/aas:relationshipElement/"
+                                                "aas:second//aas:value",
+                                                ns,
+                                            )
+
+                                            capability["properties"].append({
+                                                "property_name": (
+                                                    prop_name.text
+                                                    if prop_name is not None else ""
+                                                ),
+                                                "property_comment": (
+                                                    prop_comment.text
+                                                    if prop_comment is not None else ""
+                                                ),
+                                                "property_ID": (
+                                                    prop_id.text
+                                                    if prop_id is not None else ""
+                                                ),
+                                                "property_unit": (
+                                                    unit.text
+                                                    if unit is not None else ""
+                                                ),
+                                                "valueType": (
+                                                    vtype.text
+                                                    if vtype is not None else ""
+                                                ),
+                                                "value0": (
+                                                    scalar_value.text
+                                                    if scalar_value is not None else ""
+                                                ),
+                                                "propertyRealizedBy": (
+                                                    prop_rel_by.text
+                                                    if prop_rel_by is not None else ""
+                                                ),
+                                                "property_constraint": [],
+                                            })
 
                                         # Range Properties
                                         property_type_range = property_container.find("aas:value/aas:range", ns)
@@ -245,7 +346,7 @@ def _extract_capabilities_from_etree(tree: ET.ElementTree):
                                             for i, val_elem in enumerate(value_list):
                                                 val = val_elem.find("aas:value", ns)
                                                 result[f"value{i}"] = val.text if val is not None else ""
-                                            result['property_realized_by'] = prop_relBy.text if prop_relBy is not None else ""
+                                            result['propertyRealizedBy'] = prop_relBy.text if prop_relBy is not None else ""
                                             capability['properties'].append(result)
 
                             # Relations (GeneralizedBy / RealizedBy)
