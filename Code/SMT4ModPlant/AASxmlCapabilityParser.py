@@ -3,7 +3,40 @@ import json
 import zipfile
 import os
 import io
+import re
 from pathlib import Path
+
+
+_CAEX_ID = re.compile(
+    r"^CAEX@ID\s*=\s*[\"'\u2018\u2019\u201c\u201d]?"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    r"[\"'\u2018\u2019\u201c\u201d]?$",
+    re.IGNORECASE,
+)
+
+
+def _extract_realized_by_reference(relationship_element, ns):
+    """Return the target ID from a RealizedBy relationship reference."""
+    if relationship_element is None:
+        return ""
+
+    for reference_key in relationship_element.findall(
+        "aas:second/aas:keys/aas:key", ns
+    ):
+        reference_type = reference_key.findtext(
+            "aas:type", default="", namespaces=ns
+        )
+        if reference_type != "FragmentReference":
+            continue
+
+        value = reference_key.findtext(
+            "aas:value", default="", namespaces=ns
+        ).strip()
+        caex_match = _CAEX_ID.fullmatch(value)
+        if caex_match:
+            return caex_match.group(1)
+
+    return ""
 
 
 def _parse_capability_qualifiers(capability_element, ns):
@@ -200,8 +233,7 @@ def _extract_capabilities_from_etree(tree: ET.ElementTree):
                                                 ns,
                                             )
                                             prop_rel_by = property_container.find(
-                                                "aas:value/aas:relationshipElement/"
-                                                "aas:second//aas:value",
+                                                "aas:value/aas:relationshipElement",
                                                 ns,
                                             )
 
@@ -231,8 +263,9 @@ def _extract_capabilities_from_etree(tree: ET.ElementTree):
                                                     if scalar_value is not None else ""
                                                 ),
                                                 "propertyRealizedBy": (
-                                                    prop_rel_by.text
-                                                    if prop_rel_by is not None else ""
+                                                    _extract_realized_by_reference(
+                                                        prop_rel_by, ns
+                                                    )
                                                 ),
                                                 "property_constraint": [],
                                             })
@@ -248,7 +281,9 @@ def _extract_capabilities_from_etree(tree: ET.ElementTree):
                                             min_val = property_type_range.find("aas:min", ns)
                                             max_val = property_type_range.find("aas:max", ns)
                                             prop_comment = property_container.find("aas:value/aas:multiLanguageProperty/aas:value//aas:text", ns)
-                                            prop_relBy = property_container.find("aas:value/aas:relationshipElement/aas:second//aas:value", ns)
+                                            prop_relBy = property_container.find(
+                                                "aas:value/aas:relationshipElement", ns
+                                            )
 
                                             prop_entry = {
                                                 'property_name': prop_name.text if prop_name is not None else "",
@@ -258,7 +293,7 @@ def _extract_capabilities_from_etree(tree: ET.ElementTree):
                                                 'valueType': vtype.text if vtype is not None else "",
                                                 'valueMin': min_val.text if min_val is not None else "",
                                                 'valueMax': max_val.text if max_val is not None else "",
-                                                'propertyRealizedBy': prop_relBy.text if prop_relBy is not None else "",
+                                                'propertyRealizedBy': _extract_realized_by_reference(prop_relBy, ns),
                                                 'property_constraint': []
                                             }
                                             
@@ -333,7 +368,9 @@ def _extract_capabilities_from_etree(tree: ET.ElementTree):
                                             unit = property_type_submodelElementList.find("aas:embeddedDataSpecifications//aas:value", ns)
                                             vtype = property_type_submodelElementList.find("aas:valueTypeListElement", ns)
                                             prop_comment = property_container.find("aas:value/aas:multiLanguageProperty/aas:value//aas:text", ns)
-                                            prop_relBy = property_container.find("aas:value/aas:relationshipElement/aas:second//aas:value", ns)
+                                            prop_relBy = property_container.find(
+                                                "aas:value/aas:relationshipElement", ns
+                                            )
 
                                             result = {
                                                 'property_name': prop_name.text if prop_name is not None else "",
@@ -346,7 +383,7 @@ def _extract_capabilities_from_etree(tree: ET.ElementTree):
                                             for i, val_elem in enumerate(value_list):
                                                 val = val_elem.find("aas:value", ns)
                                                 result[f"value{i}"] = val.text if val is not None else ""
-                                            result['propertyRealizedBy'] = prop_relBy.text if prop_relBy is not None else ""
+                                            result['propertyRealizedBy'] = _extract_realized_by_reference(prop_relBy, ns)
                                             capability['properties'].append(result)
 
                             # Relations (GeneralizedBy / RealizedBy)
@@ -368,9 +405,11 @@ def _extract_capabilities_from_etree(tree: ET.ElementTree):
                                     for realized_by in capability_relations.findall("aas:value/aas:relationshipElement", ns):
                                         realized_by_semantic_id = realized_by.find("aas:semanticId//aas:value", ns)
                                         if realized_by_semantic_id is not None and "CapabilityRealizedBy/1/0" in realized_by_semantic_id.text:
-                                            realized_by_value = realized_by.find("aas:second//aas:value", ns)
-                                            if realized_by_value is not None:
-                                                capability['realized_by'].append(realized_by_value.text)
+                                            realized_by_value = _extract_realized_by_reference(
+                                                realized_by, ns
+                                            )
+                                            if realized_by_value:
+                                                capability['realized_by'].append(realized_by_value)
 
                             capabilities.append(capability)
 

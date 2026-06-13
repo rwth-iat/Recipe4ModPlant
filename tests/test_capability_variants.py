@@ -427,14 +427,117 @@ class AASCapabilityParserTests(unittest.TestCase):
         self.assertEqual(scalar_property["property_unit"], "rpm")
         self.assertEqual(scalar_property["valueType"], "xs:int")
         self.assertEqual(scalar_property["value0"], "250")
-        self.assertEqual(
-            scalar_property["propertyRealizedBy"],
-            "rotation-speed-runtime-id",
-        )
+        self.assertEqual(scalar_property["propertyRealizedBy"], "")
         self.assertEqual(scalar_property["property_constraint"], [])
         self.assertTrue(property_value_match(
             _rotation_parameter(), scalar_property
         ))
+
+    def test_parses_expanded_realized_by_references_to_caex_ids(self):
+        property_id = "1c777591-d6fb-47ad-af94-af3f73229017"
+        capability_id = "ef111e89-8362-41c2-a915-c2dbf2e3b102"
+        realized_by_xml = f"""
+                <submodelElementCollection>
+                  <idShort>PropertySet</idShort>
+                  <semanticId>
+                    <type>ExternalReference</type>
+                    <keys>
+                      <key>
+                        <type>GlobalReference</type>
+                        <value>https://admin-shell.io/idta/CapabilityDescription/PropertySet/1/0</value>
+                      </key>
+                    </keys>
+                  </semanticId>
+                  <value>
+                    <submodelElementCollection>
+                      <idShort>DurationContainer</idShort>
+                      <value>
+                        <property>
+                          <idShort>Duration</idShort>
+                          <valueType>xs:int</valueType>
+                          <value>10</value>
+                        </property>
+                        <relationshipElement>
+                          <idShort>PropertyRealizedByDuration</idShort>
+                          <second>
+                            <type>ModelReference</type>
+                            <keys>
+                              <key>
+                                <type>Submodel</type>
+                                <value>https://admin-shell.io/idta/SubmodelTemplate/ModuleTypePackage/1/0</value>
+                              </key>
+                              <key>
+                                <type>File</type>
+                                <value>MTPFile</value>
+                              </key>
+                              <key>
+                                <type>FragmentReference</type>
+                                <value>CAEX@ID=&#x2019;{property_id}&#x2019;</value>
+                              </key>
+                            </keys>
+                          </second>
+                        </relationshipElement>
+                      </value>
+                    </submodelElementCollection>
+                  </value>
+                </submodelElementCollection>
+                <submodelElementCollection>
+                  <idShort>CapabilityRelations</idShort>
+                  <semanticId>
+                    <type>ExternalReference</type>
+                    <keys>
+                      <key>
+                        <type>GlobalReference</type>
+                        <value>https://admin-shell.io/idta/CapabilityDescription/CapabilityRelations/1/0</value>
+                      </key>
+                    </keys>
+                  </semanticId>
+                  <value>
+                    <relationshipElement>
+                      <idShort>CapabilityRealizedByStirringPulseDuration</idShort>
+                      <semanticId>
+                        <type>ExternalReference</type>
+                        <keys>
+                          <key>
+                            <type>GlobalReference</type>
+                            <value>https://admin-shell.io/idta/CapabilityDescription/CapabilityRealizedBy/1/0</value>
+                          </key>
+                        </keys>
+                      </semanticId>
+                      <second>
+                        <type>ModelReference</type>
+                        <keys>
+                          <key>
+                            <type>Submodel</type>
+                            <value>https://admin-shell.io/idta/SubmodelTemplate/ModuleTypePackage/1/0</value>
+                          </key>
+                          <key>
+                            <type>File</type>
+                            <value>MTPFile</value>
+                          </key>
+                          <key>
+                            <type>FragmentReference</type>
+                            <value>CAEX@ID=&#x2019;{capability_id}&#x2019;</value>
+                          </key>
+                        </keys>
+                      </second>
+                    </relationshipElement>
+                  </value>
+                </submodelElementCollection>
+"""
+        xml = _minimal_capability_xml("StirringPulseDuration").replace(
+            "</capability>",
+            f"</capability>{realized_by_xml}",
+            1,
+        )
+
+        capability = _parse_capability_xml(xml)[0]
+
+        self.assertEqual(
+            capability["properties"][0]["propertyRealizedBy"],
+            property_id,
+        )
+        self.assertEqual(capability["realized_by"], [capability_id])
 
 
 class PropertyMatchingTests(unittest.TestCase):
